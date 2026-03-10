@@ -1,0 +1,9 @@
+# Ignore the secrets vault
+.env
+
+# Ignore the virtual environment
+venv/
+__pycache__/
+
+# (Optional) Ignore the database backup if you have one
+*.csv
