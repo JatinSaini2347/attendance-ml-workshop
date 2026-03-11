@@ -1,30 +1,62 @@
+import os
 import mysql.connector
 import pandas as pd
 from mysql.connector import Error
+from dotenv import load_dotenv
 
-def setup_mysql_database(csv_filename):
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME", "workshop_attendance")
+
+REQUIRED_COLUMNS = [
+    "student_id",
+    "student_name",
+    "team_name",
+    "total_classes",
+    "classes_attended",
+    "homework_score_avg",
+    "assignments_completed"
+]
+
+
+def get_connection():
     try:
-        # 1. Connect to your local MySQL Server
-        connection = mysql.connector.connect(
-            host='localhost',
-            user='root',
-            password='Pablo$100' 
+        return mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD
         )
-        cursor = connection.cursor()
+    except Error:
+        raise RuntimeError("Database connection failed")
 
-        # 2. Create the Database
-        cursor.execute("CREATE DATABASE IF NOT EXISTS workshop_attendance;")
-        cursor.execute("USE workshop_attendance;")
-        print("Database 'workshop_attendance' ready.")
 
-        # 3. Create the Normalized Tables
-        create_teams_table = """
+def validate_csv(df):
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in CSV: {missing}")
+
+    if df.empty:
+        raise ValueError("CSV file is empty")
+
+    return df[REQUIRED_COLUMNS]
+
+
+def create_schema(cursor):
+
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
+    cursor.execute(f"USE {DB_NAME}")
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS Teams (
             team_id INT AUTO_INCREMENT PRIMARY KEY,
             team_name VARCHAR(255) UNIQUE NOT NULL
-        );
-        """
-        create_students_table = """
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS Students (
             student_id INT PRIMARY KEY,
             student_name VARCHAR(255) NOT NULL,
@@ -34,57 +66,107 @@ def setup_mysql_database(csv_filename):
             homework_score_avg FLOAT,
             assignments_completed INT,
             FOREIGN KEY (team_id) REFERENCES Teams(team_id)
-        );
-        """
-        cursor.execute(create_teams_table)
-        cursor.execute(create_students_table)
-        print("Tables 'Teams' and 'Students' created.")
+        )
+    """)
 
-        # 4. Read the generated CSV data
-        df = pd.read_csv(csv_filename)
 
-        # 5. Insert the 8 Teams First
-        unique_teams = df['team_name'].unique()
-        for team in unique_teams:
-            cursor.execute("INSERT IGNORE INTO Teams (team_name) VALUES (%s)", (team,))
-        connection.commit()
+def insert_teams(cursor, teams):
 
-        # Fetch the auto-generated team IDs to link to the students
-        cursor.execute("SELECT team_id, team_name FROM Teams;")
-        team_mapping = {name: id for id, name in cursor.fetchall()}
+    query = "INSERT IGNORE INTO Teams (team_name) VALUES (%s)"
 
-        # 6. Insert the 40 Students
-        insert_student_query = """
+    for team in teams:
+        if isinstance(team, str) and len(team) <= 255:
+            cursor.execute(query, (team.strip(),))
+
+
+def build_team_map(cursor):
+
+    cursor.execute("SELECT team_id, team_name FROM Teams")
+
+    mapping = {}
+    for team_id, team_name in cursor.fetchall():
+        mapping[team_name] = team_id
+
+    return mapping
+
+
+def insert_students(cursor, df, team_map):
+
+    insert_query = """
         INSERT IGNORE INTO Students (
-            student_id, student_name, team_id, total_classes, 
-            classes_attended, homework_score_avg, assignments_completed
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        for index, row in df.iterrows():
-            current_team_id = team_mapping[row['team_name']]
-            
-            student_data = (
-                row['student_id'],
-                row['student_name'],
-                current_team_id,
-                row['total_classes'],
-                row['classes_attended'],
-                row['homework_score_avg'],
-                row['assignments_completed']
-            )
-            cursor.execute(insert_student_query, student_data)
-            
-        connection.commit()
-        print(f"Successfully inserted {len(df)} student records into the MySQL database!")
+            student_id,
+            student_name,
+            team_id,
+            total_classes,
+            classes_attended,
+            homework_score_avg,
+            assignments_completed
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """
 
-    except Error as e:
-        print(f"Error connecting to MySQL: {e}")
+    for _, row in df.iterrows():
+
+        team_id = team_map.get(row["team_name"])
+
+        if not team_id:
+            continue
+
+        student_data = (
+            int(row["student_id"]),
+            str(row["student_name"]).strip(),
+            int(team_id),
+            int(row["total_classes"]),
+            int(row["classes_attended"]),
+            float(row["homework_score_avg"]),
+            int(row["assignments_completed"])
+        )
+
+        cursor.execute(insert_query, student_data)
+
+
+def setup_database(csv_file):
+
+    if not os.path.exists(csv_file):
+        raise FileNotFoundError("CSV file not found")
+
+    df = pd.read_csv(csv_file)
+    df = validate_csv(df)
+
+    conn = None
+    cursor = None
+
+    try:
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        create_schema(cursor)
+
+        teams = df["team_name"].unique()
+        insert_teams(cursor, teams)
+
+        conn.commit()
+
+        team_map = build_team_map(cursor)
+
+        insert_students(cursor, df, team_map)
+
+        conn.commit()
+
+        print(f"{len(df)} records inserted successfully")
+
+    except Exception as e:
+        print("Operation failed:", str(e))
+
     finally:
-        if 'connection' in locals() and connection.is_connected():
+
+        if cursor:
             cursor.close()
-            connection.close()
-            print("MySQL connection closed.")
+
+        if conn and conn.is_connected():
+            conn.close()
+
 
 if __name__ == "__main__":
-    setup_mysql_database('workshop_students_ml_data.csv')
+    setup_database("workshop_students_ml_data.csv")
